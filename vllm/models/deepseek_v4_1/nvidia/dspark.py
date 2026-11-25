@@ -36,6 +36,9 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsConfig,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -55,6 +58,7 @@ from vllm.models.common.ops.sequence_parallel import (
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
+    DeepseekV41LLMForCausalLM,
     _linear_scale_param_name,
     _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
@@ -110,13 +114,19 @@ class DSparkDeepseekV4Model(nn.Module):
                 prefix=maybe_prefix(prefix, "embed_tokens"),
             )
 
+        main_proj_prefix = maybe_prefix(prefix, "main_proj")
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, CompressedTensorsConfig):
+            scheme = quant_config.get_scheme_dict(self, "mtp.0.main_proj")
+            if scheme is not None:
+                quant_config.target_scheme_map[main_proj_prefix] = scheme
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
             config.hidden_size,
             bias=False,
             return_bias=False,
             quant_config=vllm_config.quant_config,
-            prefix=maybe_prefix(prefix, "main_proj"),
+            prefix=main_proj_prefix,
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -317,6 +327,7 @@ def _insert_context_kv(
 class DSparkDeepseekV4ForCausalLM(nn.Module):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's.
+    packed_modules_mapping = DeepseekV41LLMForCausalLM.packed_modules_mapping
     has_own_embed_tokens = False
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
