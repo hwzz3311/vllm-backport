@@ -573,6 +573,11 @@ def sparse_attn_indexer(
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
+            if chunk.max_local_total_seq_lens > k_quant_full.shape[0]:
+                raise RuntimeError(
+                    "Sparse indexer K-gather chunk exceeds workspace capacity: "
+                    f"{chunk.max_local_total_seq_lens} > {k_quant_full.shape[0]}"
+                )
             k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:

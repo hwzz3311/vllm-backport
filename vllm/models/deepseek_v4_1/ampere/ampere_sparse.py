@@ -32,6 +32,11 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
 
     backend_cls = DeepseekV41AmpereMLASparseBackend
 
+    # Keep only one sequence's dequantized KV in the prefill workspace.
+    # Both profiling and the actual prefill loop use this same tile size;
+    # scheduler concurrency and each sequence's context limit are unchanged.
+    PREFILL_CHUNK_SIZE = 1
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # The ROCm layer routes wo_a through the ordinary MXFP8 linear kernel
