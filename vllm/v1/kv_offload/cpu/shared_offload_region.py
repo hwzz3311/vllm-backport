@@ -288,6 +288,7 @@ class SharedOffloadRegion:
         kv_bytes_per_chunk: int,
         cpu_page_size: int,
         barrier: Callable[[], None] | None = None,
+        private: bool = False,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_chunk % self.page_size == 0
@@ -315,6 +316,16 @@ class SharedOffloadRegion:
             self._worker_area_end = (rank + 1) * cpu_page_size
         self.fd: int | None = None
         self.mmap_obj: mmap.mmap | None = None
+        if private:
+            if rank != 0 or barrier is not None or kv_bytes_per_chunk != cpu_page_size:
+                raise ValueError("Private KV arena must contain exactly one local slot")
+            self.mmap_obj = mmap.mmap(-1, self.total_size_bytes)
+            try:
+                self._map_and_populate(None, num_chunks, cpu_page_size)
+            except Exception:
+                self.mmap_obj.close()
+                raise
+            return
         try:
             if self.backend == "memfd":
                 self._init_memfd(engine_id)
