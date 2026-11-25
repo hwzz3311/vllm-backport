@@ -181,6 +181,24 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 weight_quant, input_quant, layer.moe_config
             )
         elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
+            if (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability(80)
+                and layer.moe_config.moe_backend == "marlin"
+                and format == CompressionFormat.pack_quantized.value
+                and weight_quant.type == QuantizationType.INT
+                and weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and weight_quant.actorder is None
+                and input_quant.type == QuantizationType.INT
+                and input_quant.symmetric
+            ):
+                from .compressed_tensors_moe_wna16 import (
+                    CompressedTensorsWNA16MoEMethod,
+                )
+
+                return CompressedTensorsWNA16MoEMethod(
+                    weight_quant, input_quant, layer.moe_config
+                )
             from .compressed_tensors_moe_w4a8_int8 import (
                 CompressedTensorsW4A8Int8MoEMethod,
             )
