@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.kv_offload.base import (
@@ -103,6 +104,7 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    prefix_cacheable: bool = True
 
     def load_window_size_in_chunks(self, num_tokens: int) -> int | None:
         window = self.sliding_window_size_in_chunks
@@ -119,6 +121,16 @@ class GroupOffloadConfig(NamedTuple):
                 ),
             )
         return window
+
+
+def resolve_offload_group_spec(spec: KVCacheSpec) -> KVCacheSpec:
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        layers = spec.kv_cache_specs
+        first = spec.first_spec
+        if not first.is_uniform_with_collection(layers):
+            raise ValueError("Native KV offload requires uniform group semantics")
+        return first
+    return spec
 
 
 def get_sliding_window_size_in_chunks(
@@ -189,7 +201,10 @@ class SchedulerOffloadConfig(NamedTuple):
         # architectures like DeepSeek V4 (MLA + SWA groups).
         full_attn_tokens_per_chunk: set[int] = set()
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
-            kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            group_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            if not group_spec.prefix_cacheable:
+                continue
+            kv_spec = resolve_offload_group_spec(group_spec)
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
             )
@@ -206,7 +221,9 @@ class SchedulerOffloadConfig(NamedTuple):
             alignment_tokens = full_attn_tokens_per_chunk.pop()
         elif not full_attn_tokens_per_chunk:
             all_tokens_per_chunk = [
-                tpb * spec.blocks_per_chunk for tpb in spec.tokens_per_block
+                tpb * spec.blocks_per_chunk
+                for group, tpb in zip(kv_cache_config.kv_cache_groups, spec.tokens_per_block)
+                if group.kv_cache_spec.prefix_cacheable
             ]
             if all_tokens_per_chunk:
                 alignment_tokens = max(all_tokens_per_chunk)
@@ -251,9 +268,14 @@ class SchedulerOffloadConfig(NamedTuple):
         kv_group_configs_list: list[GroupOffloadConfig] = []
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
-            kv_spec = kv_cache_group.kv_cache_spec
-            sw = get_sliding_window_size_in_chunks(
-                kv_spec, tokens_per_block * spec.blocks_per_chunk
+            group_spec = kv_cache_group.kv_cache_spec
+            cacheable = group_spec.prefix_cacheable
+            kv_spec = resolve_offload_group_spec(group_spec)
+            sw = (
+                get_sliding_window_size_in_chunks(
+                    kv_spec, tokens_per_block * spec.blocks_per_chunk
+                )
+                if cacheable else None
             )
             manager_cls = KVCacheSpecRegistry.get_manager_class(kv_spec)
             assert manager_cls is not None, (
@@ -273,6 +295,7 @@ class SchedulerOffloadConfig(NamedTuple):
                     manager_cls=manager_cls,
                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
                     is_eagle_group=idx in eagle_groups,
+                    prefix_cacheable=cacheable,
                     requires_cow_source=(
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
@@ -291,6 +314,7 @@ class SchedulerOffloadConfig(NamedTuple):
         # group's source. EAGLE and DCP need additional hand-off semantics.
         supports_partial_tail = (
             spec.blocks_per_chunk == 1
+            and all(c.prefix_cacheable for c in kv_group_configs)
             and len(group_block_sizes) == 1
             and has_partial_recurrent_group
             and all(
@@ -393,6 +417,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if not group_config.prefix_cacheable:
+                continue
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -545,6 +571,8 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            if not group_config.prefix_cacheable:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
@@ -561,6 +589,13 @@ class OffloadingConnectorScheduler:
         # used by _lookup
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
+        logger.info(
+            "Native KV groups (id, spec, block, window_chunks, cacheable, draft)=%s; lookup=%s alignment=%s hash=%d",
+            [(g.group_idx, type(g.kv_cache_spec).__name__, g.tokens_per_block,
+              g.sliding_window_size_in_chunks, g.prefix_cacheable, g.is_eagle_group)
+             for g in self.config.kv_group_configs],
+            self._lookup_groups, self.config.alignment_tokens, self.config.tokens_per_hash,
+        )
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
         )
@@ -1099,6 +1134,11 @@ class OffloadingConnectorScheduler:
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
             )
+
+            if not group_config.prefix_cacheable:
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
 
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk

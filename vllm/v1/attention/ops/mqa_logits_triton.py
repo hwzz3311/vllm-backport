@@ -520,6 +520,8 @@ def fp8_mqa_logits_triton(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     clean_logits: bool = True,
+    *,
+    predecoded_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of DeepGEMM's fp8_mqa_logits.
 
@@ -541,6 +543,7 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ks,
         cu_seqlen_ke,
         _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
+        predecoded_k=predecoded_k,
     )
 
 
@@ -551,6 +554,8 @@ def _fp8_mqa_logits_triton_impl(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
     kv_group: int,
+    *,
+    predecoded_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
     k_fp8, k_scales = kv
     k_scales = k_scales.reshape(-1)
@@ -568,7 +573,7 @@ def _fp8_mqa_logits_triton_impl(
 
     # Pre-decode FP8 → bf16; the kernel runs a straight `tl.dot`.
     q_bf16 = q.to(torch.bfloat16)
-    k_bf16 = k_fp8.to(torch.bfloat16)
+    k_bf16 = k_fp8.to(torch.bfloat16) if predecoded_k is None else predecoded_k
 
     # Grid depends on the autotuned BLOCK_N and the M/N-selected KV_GROUP.
     grid = lambda meta: (  # noqa: E731

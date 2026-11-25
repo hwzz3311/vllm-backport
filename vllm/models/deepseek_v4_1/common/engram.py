@@ -49,6 +49,9 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsConfig,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
@@ -185,6 +188,21 @@ class EngramLayout:
         self.compressed_vocab_size: int = config.engram_compressed_vocab_size
         self.pad_token_id: int = config.engram_pad_token_id
         assert len(self.layer_ids) == len(self.num_embeddings)
+
+        # Match the checkpoint layout before allocating the embedding tables.
+        quant = getattr(config, "quantization_config", None) or {}
+        embed_quant = quant.get("engram_embed_quant", "fp8")
+        if embed_quant not in ("fp8", "mxfp4"):
+            raise ValueError(f"Unsupported engram_embed_quant {embed_quant!r}")
+        for key, expected in (
+            ("engram_embed_block_size", 32),
+            ("engram_embed_scale_dtype", "ue8m0"),
+        ):
+            if quant.get(key, expected) != expected:
+                raise ValueError(f"{key} must be {expected!r}")
+        if set(quant.get("engram_embed_layers", self.layer_ids)) != set(self.layer_ids):
+            raise ValueError("engram_embed_layers must match engram_layer_ids")
+        self.packed_fp4 = embed_quant == "mxfp4"
 
         primes = []
         seen: set[int] = set()
@@ -580,8 +598,10 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     GRID: tl.constexpr,
+    PACKED_FP4: tl.constexpr,
+    ROW_INT8: tl.constexpr,
 ):
-    """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
+    """Gather FP8, packed MXFP4 or INT8 rows and write scaled BF16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
     `weight`/`scales` may address pinned host memory through UVA. `weight` is
@@ -602,19 +622,42 @@ def _engram_lookup_kernel(
         owned = valid & (head < TOTAL_HEADS)
         owned &= (index >= vocab_start) & (index < vocab_end)
         local = tl.where(owned, index - vocab_start, 0)
-        values = tl.load(
-            weight + local[:, None] * DIM + cols[None, :],
-            mask=owned[:, None],
-            other=0,
-        )
-        values = _decode_fp8_f32(values, False)
-        scale = tl.load(
-            scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
-            mask=owned[:, None],
-            other=0,
-        )
-        # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
-        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        if PACKED_FP4:
+            # E2M1: even columns use the low nibble, odd columns the high.
+            byte = tl.load(
+                weight + local[:, None] * (DIM // 2) + (cols // 2)[None, :],
+                mask=owned[:, None],
+                other=0,
+            ).to(tl.int32)
+            nibble = (byte >> (4 * (cols[None, :] % 2))) & 0xF
+            exponent = (nibble >> 1) & 3
+            mantissa = (nibble & 1).to(tl.float32)
+            pow2 = ((exponent + 125) << 23).to(tl.float32, bitcast=True)
+            magnitude = tl.where(
+                exponent == 0, mantissa * 0.5, (2 + mantissa) * pow2
+            )
+            values = tl.where((nibble & 8) != 0, -magnitude, magnitude)
+        else:
+            values = tl.load(
+                weight + local[:, None] * DIM + cols[None, :],
+                mask=owned[:, None],
+                other=0,
+            )
+            if ROW_INT8:
+                values = values.to(tl.float32)
+            else:
+                values = _decode_fp8_f32(values, False)
+        if ROW_INT8:
+            scale = tl.load(scales + local, mask=owned, other=0).to(tl.float32)
+            scale = scale[:, None]
+        else:
+            scale = tl.load(
+                scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
+                mask=owned[:, None],
+                other=0,
+            )
+            # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
+            scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         tl.store(
             out + rows[:, None] * DIM + cols[None, :],
             (values * scale).to(tl.bfloat16),
@@ -624,11 +667,13 @@ def _engram_lookup_kernel(
 
 class ParallelEngramEmbedding(nn.Module):
     """The n-gram hash table, sharded by complete hash heads over TP ranks.
-    Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
+    FP8/MXFP4 rows use per-32 UE8M0 scales. INT8 rows use one BF16 scale each.
 
     With `cpu_offload` the shard lives in pinned host memory and is read over
     UVA instead of HBM; the TP sharding is unchanged either way.
     """
+
+    packed_fp4: bool = False
 
     def __init__(
         self,
@@ -637,6 +682,9 @@ class ParallelEngramEmbedding(nn.Module):
         head_sizes: tuple[int, ...],
         block_size: int = 32,
         cpu_offload: bool = False,
+        *,
+        packed_fp4: bool = False,
+        row_int8: bool = False,
     ):
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -648,6 +696,20 @@ class ParallelEngramEmbedding(nn.Module):
         self.num_embeddings = num_embeddings
         self.dim = dim
         self.block_size = block_size
+        if packed_fp4 and (block_size != 32 or dim % block_size != 0):
+            raise ValueError("MXFP4 Engram requires complete 32-value blocks")
+        if packed_fp4 and row_int8:
+            raise ValueError("Engram cannot use both MXFP4 and INT8 storage")
+        self.packed_fp4 = packed_fp4
+        self.row_int8 = row_int8
+        row_bytes = dim // 2 if packed_fp4 else dim
+        weight_dtype = torch.uint8 if packed_fp4 else torch.float8_e4m3fn
+        scale_columns = dim // block_size
+        scale_dtype = torch.uint8
+        if row_int8:
+            weight_dtype = torch.int8
+            scale_columns = 1
+            scale_dtype = torch.bfloat16
         self.n_hash_cols = len(head_sizes)
         self.part_n_hash_cols = triton.cdiv(self.n_hash_cols, tp_size)
         self.head_start = tp_rank * self.part_n_hash_cols
@@ -668,15 +730,15 @@ class ParallelEngramEmbedding(nn.Module):
         kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
         self.weight = nn.Parameter(
             torch.empty(
-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
+                self.part_num_embeddings, row_bytes, dtype=weight_dtype, **kwargs
             ),
             requires_grad=False,
         )
         self.weight_scale_inv = nn.Parameter(
             torch.empty(
                 self.part_num_embeddings,
-                dim // block_size,
-                dtype=torch.uint8,
+                scale_columns,
+                dtype=scale_dtype,
                 **kwargs,
             ),
             requires_grad=False,
@@ -695,7 +757,7 @@ class ParallelEngramEmbedding(nn.Module):
                 "%.2f GiB per rank",
                 self.part_num_embeddings,
                 dim,
-                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+                (self.weight.nbytes + self.weight_scale_inv.nbytes) / 1024**3,
             )
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -732,7 +794,7 @@ class ParallelEngramEmbedding(nn.Module):
         tiles = triton.cdiv(rows, 16)
         grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
         _engram_lookup_kernel[(grid,)](
-            weight.view(torch.uint8),
+            weight if self.row_int8 else weight.view(torch.uint8),
             scales,
             indices,
             out,
@@ -748,6 +810,8 @@ class ParallelEngramEmbedding(nn.Module):
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
             GRID=grid,
+            PACKED_FP4=self.packed_fp4,
+            ROW_INT8=self.row_int8,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
@@ -909,12 +973,30 @@ class Engram(nn.Module):
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
         # suffix rule.
+        row_int8 = False
+        if isinstance(quant_config, CompressedTensorsConfig):
+            scheme = quant_config.get_scheme_dict(self, f"{prefix}.embed")
+            if scheme is not None:
+                weight = scheme["weights"]
+                if not (
+                    scheme["format"] == "int-quantized"
+                    and scheme["input_activations"] is None
+                    and weight.type == "int"
+                    and weight.num_bits == 8
+                    and weight.strategy == "channel"
+                    and weight.symmetric
+                    and not weight.dynamic
+                ):
+                    raise ValueError(f"Unsupported compressed Engram scheme: {scheme}")
+                row_int8 = True
         engram_config = get_current_vllm_config().engram_config
         self.embed_tokens = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=engram_config.cpu_offload if engram_config else True,
+            packed_fp4=layout.packed_fp4,
+            row_int8=row_int8,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(

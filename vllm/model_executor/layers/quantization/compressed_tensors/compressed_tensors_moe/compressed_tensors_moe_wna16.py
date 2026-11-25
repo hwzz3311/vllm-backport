@@ -123,7 +123,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             assert check_moe_marlin_supports_config(
                 self.moe, self.group_size, allow_tile_padding=True
             )
-            self.input_dtype = get_marlin_input_dtype(layer_name)
+            self.input_dtype = (
+                torch.int8
+                if input_quant is not None
+                else get_marlin_input_dtype(layer_name)
+            )
         else:
             # channelwise is not supported by this kernel
             assert weight_quant.strategy == "group"
@@ -404,6 +408,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             backend=self.wna16_backend,
             routing_tables=layer._expert_routing_tables(),
         )
+        if self.is_marlin:
+            self.moe_kernel.fused_experts.input_dtype = self.input_dtype
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Process weights using the shared oracle infrastructure

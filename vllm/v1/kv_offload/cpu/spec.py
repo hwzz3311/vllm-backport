@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from typing_extensions import override
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
@@ -22,6 +23,8 @@ from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+logger = init_logger(__name__)
 
 
 def _all_workers_barrier() -> None:
@@ -105,6 +108,14 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
+        self.private_rank_arena = (
+            self.extra_config.get("private_rank_arena") is True
+            and type(self) is CPUOffloadingSpec
+            and not self.replicated_layout
+            and current_platform.is_cuda_alike()
+        )
+        if self.extra_config.get("private_rank_arena") and not self.private_rank_arena:
+            raise ValueError("Private rank arenas require non-replicated native CUDA offload")
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
             num_copies = 1 if self.replicated_layout else world_size
             kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
@@ -112,6 +123,11 @@ class CPUOffloadingSpec(OffloadingSpec):
 
             # calculate cpu_page_size_per_worker
             self.cpu_page_size_per_worker = kv_bytes_per_chunk // num_copies
+            if self.private_rank_arena:
+                self.cpu_page_size_per_worker = round_up(
+                    self.cpu_page_size_per_worker, self.BLOCK_SIZE_ALIGNMENT
+                )
+                kv_bytes_per_chunk = self.cpu_page_size_per_worker * num_copies
 
             # calculate num_chunks
             aligned_kv_bytes_per_chunk = round_up(
@@ -168,7 +184,25 @@ class CPUOffloadingSpec(OffloadingSpec):
         mmap_region: SharedOffloadRegion | None = None
         # num_chunks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
-        if self._uses_shared_region() and self.num_chunks > 0:
+        if self.private_rank_arena and self.num_chunks > 0:
+            logger.info(
+                "Native private KV arena: worker=%d chunks=%d slot_bytes=%d local_bytes=%d total_budget_bytes=%d",
+                self.config.parallel.rank, self.num_chunks,
+                self.cpu_page_size_per_worker,
+                self.num_chunks * self.cpu_page_size_per_worker,
+                self.num_chunks * self.kv_bytes_per_chunk,
+            )
+            # Workers share logical chunk IDs, not bytes. Each worker owns
+            # a contiguous arena and registers only its local pages.
+            mmap_region = SharedOffloadRegion(
+                engine_id=self.config.engine_id,
+                num_chunks=self.num_chunks,
+                rank=0,
+                kv_bytes_per_chunk=self.cpu_page_size_per_worker,
+                cpu_page_size=self.cpu_page_size_per_worker,
+                private=True,
+            )
+        elif self._uses_shared_region() and self.num_chunks > 0:
             # Replicated layout puts all ranks on slot 0 (single MLA copy);
             # otherwise each rank takes its own slot by physical device index.
             if self.replicated_layout:

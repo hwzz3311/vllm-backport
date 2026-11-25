@@ -848,8 +848,25 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            ready_kv_waiting = None
+            if not self.running and self.finished_recving_kv_req_ids:
+                # Completed loads already hold GPU blocks. Give them a chance
+                # to run and release those blocks before admitting new loads.
+                ready_kv_requests = [
+                    req
+                    for req in self.skipped_waiting
+                    if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and req.request_id in self.finished_recving_kv_req_ids
+                ]
+                if ready_kv_requests:
+                    ready_kv_waiting = create_request_queue(self.policy)
+                    self.skipped_waiting.remove_requests(ready_kv_requests)
+                    for req in ready_kv_requests:
+                        ready_kv_waiting.add_request(req)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (
+                ready_kv_waiting or self.waiting or self.skipped_waiting
+            ) and token_budget > 0:
                 if input_budget <= draft_slots:
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -858,7 +875,9 @@ class Scheduler(SchedulerInterface):
                 if num_running >= self.max_num_running_reqs:
                     break
 
-                request_queue = self._select_waiting_queue_for_scheduling()
+                request_queue = (
+                    ready_kv_waiting or self._select_waiting_queue_for_scheduling()
+                )
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
@@ -1284,6 +1303,11 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+            if ready_kv_waiting:
+                # Carry unscheduled completed loads over in their original order.
+                for req in reversed(list(ready_kv_waiting)):
+                    self.skipped_waiting.prepend_request(req)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:

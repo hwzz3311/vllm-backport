@@ -13,6 +13,7 @@ def build_deepseek_v4_rope(
     rope_head_dim: int,
     max_position_embeddings: int,
     compress_ratio: int,
+    cache_max_rows: int | None = None,
 ) -> RotaryEmbedding:
     rope_parameters = config.rope_parameters
     # Newer checkpoints nest per-layer-type rope dicts ({"main", "compress"});
@@ -45,6 +46,8 @@ def build_deepseek_v4_rope(
     rope_parameters["mscale_all_dim"] = 0  # Disable mscale
     rope_parameters["is_deepseek_v4"] = True
     rope_parameters["rope_dim"] = rope_head_dim
+    if cache_max_rows is not None:
+        rope_parameters["cache_max_rows"] = cache_max_rows
     return get_rope(
         head_dim,
         max_position=max_position_embeddings,

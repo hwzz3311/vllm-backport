@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -437,6 +439,19 @@ def sparse_attn_indexer(
         )
         assert candidate_block_size > 0
 
+    reuse_bf16_k = (
+        os.environ.get("VLLM_EXPERIMENT_DSV41_INDEXER_BF16_K_WS") == "1"
+        and hidden_states.device.type == "cuda"
+        and current_platform.is_cuda()
+        and current_platform.get_device_capability() == (8, 0)
+        and candidate_blocks is not None
+        and not use_fp4_cache
+        and not is_deep_gemm_supported()
+        and dcp_world_size == 1
+        and envs.VLLM_DSV4_LOGITS_ROW_CHUNK > 0
+    )
+    bf16_k_spec = (((total_seq_lens, head_dim), torch.bfloat16),) if reuse_bf16_k else ()
+
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
@@ -447,6 +462,7 @@ def sparse_attn_indexer(
             values_spec,
             scales_spec,
             ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            *bf16_k_spec,
         )
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
@@ -565,14 +581,20 @@ def sparse_attn_indexer(
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
-        k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
+        k_quant_full, k_scale_full, *k_scratch = workspace_manager.get_simultaneous(
             values_spec,
             scales_spec,
+            *bf16_k_spec,
         )
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
+            if chunk.max_local_total_seq_lens > k_quant_full.shape[0]:
+                raise RuntimeError(
+                    "Sparse indexer K-gather chunk exceeds workspace capacity: "
+                    f"{chunk.max_local_total_seq_lens} > {k_quant_full.shape[0]}"
+                )
             k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
@@ -638,6 +660,10 @@ def sparse_attn_indexer(
                     # block's logits immediately.
                     row_step = envs.VLLM_DSV4_LOGITS_ROW_CHUNK
                     num_rows = q_slice_cast.shape[0]
+                    predecoded_k = None
+                    if k_scratch:
+                        predecoded_k = k_scratch[0][:k_quant_cast.shape[0]]
+                        predecoded_k.copy_(k_quant_cast)
                     for r0 in range(0, num_rows, row_step):
                         r1 = min(r0 + row_step, num_rows)
                         logits = fp8_mqa_logits_triton(
@@ -647,6 +673,7 @@ def sparse_attn_indexer(
                             cu_seqlen_ks[r0:r1],
                             cu_seqlen_ke[r0:r1],
                             clean_logits=False,
+                            predecoded_k=predecoded_k,
                         )
                         _apply_prefill_candidates(
                             logits,

@@ -359,10 +359,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     # should be w8a16fp8 w8a16fp8 can also run for cases where
                     # there is an input_quant but it is ignored
                     if not input_activations:
-                        assert (
-                            target_scheme_map[target]["weights"].type
-                            == QuantizationType.FLOAT
-                        )
+                        # int-quantized also stores weight-only embeddings.
+                        effective_format = format or quant_format
+                        if effective_format != CompressionFormat.int_quantized.value:
+                            assert (
+                                weight_quant.type == QuantizationType.FLOAT
+                            )
                     else:
                         target_scheme_map[target]["input_activations"] = (
                             QuantizationArgs.model_validate(

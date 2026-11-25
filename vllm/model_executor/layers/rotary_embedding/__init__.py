@@ -298,6 +298,8 @@ def get_rope(
         }
         if rope_parameters.get("is_deepseek_v4", False):
             cls = DeepseekV4ScalingRotaryEmbedding
+            if "cache_max_rows" in rope_parameters:
+                extra_kwargs["cache_max_rows"] = rope_parameters["cache_max_rows"]
         else:
             cls = DeepseekScalingRotaryEmbedding
         rotary_emb = cls(

@@ -928,6 +928,9 @@ def _make_deepseek_v4_weights_mapper(
             re.compile(r"(engram\.embed)\.scale$"): r"\1_tokens.weight_scale_inv",
             re.compile(r"\.scale$"): f".{linear_scale_name}",
         }
+    scale_regex[re.compile(r"(engram\.embed)\.weight_scale$")] = (
+        r"\1_tokens.weight_scale_inv"
+    )
     return WeightsMapper(
         orig_to_new_prefix={
             "layers.": "model.layers.",
@@ -1021,6 +1024,13 @@ class DeepseekV41LLMForCausalLM(
         self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
             expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
         )
+
+        quant_config = vllm_config.quant_config
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "compressed-tensors"
+        ):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

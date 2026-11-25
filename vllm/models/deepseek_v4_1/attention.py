@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -350,6 +351,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             rope_head_dim=self.rope_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             compress_ratio=self.compress_ratio,
+            cache_max_rows=(
+                vllm_config.model_config.max_model_len
+                + vllm_config.scheduler_config.max_num_batched_tokens
+                if __import__("os").environ.get("VLLM_EXPERIMENT_DSV41_CAP_ROPE") == "1"
+                else None
+            ),
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
@@ -1089,6 +1096,19 @@ class DeepseekV4Indexer(nn.Module):
         self.max_total_seq_len = (
             get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
         )
+        if (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(80)
+            and not current_platform.has_device_capability(90)
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        ):
+            # The workspace stores compressed keys, not query rows. The
+            # scheduler cannot submit more than max_num_seqs distinct sequences
+            # in a step; each has at most max_model_len tokens.
+            self.max_total_seq_len = min(
+                self.max_total_seq_len,
+                vllm_config.scheduler_config.max_num_seqs * self.max_model_len,
+            )
 
         assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
         if owns_k:
