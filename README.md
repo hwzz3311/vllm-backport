@@ -1,3 +1,25 @@
+# DeepSeek V4.1 Flash W4A8 on 4× A800
+
+This branch packages the tested W4A8 Python patches for the existing SM80 backport image. Start with the [RC 2 download](https://github.com/hwzz3311/vllm-backport/releases/tag/dsv41-sm80-v0.1.0-rc.2) or run the launcher directly from this checkout. You need Linux, Docker with NVIDIA container support, four A800 80 GB GPUs, and host RAM for Engram and the 128 GiB prefix cache.
+
+```bash
+modelscope download \
+  --model baidu-aicapx/DeepSeek-V4.1-Flash-1017-W4A8-INT4-Dynamic \
+  --local_dir ./DeepSeek-V4.1-Flash-1017-W4A8-INT4-Dynamic
+
+bash deploy/dsv41-sm80/launch.sh --check
+MODEL_DIR=./DeepSeek-V4.1-Flash-1017-W4A8-INT4-Dynamic \
+  GPU_DEVICES=0,1,2,3 bash deploy/dsv41-sm80/launch.sh --start
+```
+
+With the download archive, use `bash launch.sh`. The default profile uses a 3072-token batch, six sequences, and a 512K per-request context window. Set `PREFILL_PROFILE=capacity` for the 1280-token fallback. Both profiles use the scheduler's default per-request prefill behavior. The launcher prints the log directory and serves on `http://127.0.0.1:18182`.
+
+The context limit and sequence limit are separate settings. The earlier run had enough GPU KV for about 5.71 independent full 512K contexts. Multi-image concurrency on the updated launcher is pending GPU validation. [Detailed setup, API test, and tuning](deploy/dsv41-sm80/README.md) · [Benchmark evidence](https://github.com/hwzz3311/vllm-backport/tree/a03addbc419a894de5f8991402af80ebb16f9b16/benchmarks/dsv41_sm80_evidence)
+
+---
+
+## Upstream vLLM Backport documentation
+
 # vLLM Backport
 
 A vLLM fork that focuses on running frontier models on older cards like A6000, 3090 and A100.
